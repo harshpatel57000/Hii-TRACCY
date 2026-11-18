@@ -2,7 +2,7 @@ import os
 import sys
 import traceback
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -24,32 +23,59 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from core.brain import TraccyBrain
+from core.permissions import PermissionManager
+from core.planner import CollaborativePlanner
+from memory.db import TraccyMemory
 from tools.api_tester import test_api_endpoint
 from tools.code_scanner import list_project_files, read_code_file
 from voice.voice_engine import VoiceEngine
 
 
 class AIWorker(QThread):
-    finished = Signal(str, str)
+    token_received = Signal(str, str)       # (token_chunk, target_tab)
+    finished = Signal(str, str, bool)       # (full_reply, target_tab, is_plan)
 
-    def __init__(self, brain: TraccyBrain, prompt: str, target_tab: str = "console", stateless: bool = False):
+    def __init__(
+        self,
+        brain: TraccyBrain,
+        prompt: str,
+        target_tab: str = "console",
+        stateless: bool = False,
+        is_plan: bool = False,
+        max_tokens: int = 110,
+    ):
         super().__init__()
         self.brain = brain
         self.prompt = prompt
         self.target_tab = target_tab
         self.stateless = stateless
+        self.is_plan = is_plan
+        self.max_tokens = max_tokens
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
 
     def run(self):
+        collected = []
         try:
-            reply = self.brain.ask(self.prompt, stateless=self.stateless)
+            for token in self.brain.ask_stream(
+                self.prompt,
+                stateless=self.stateless,
+                max_tokens=self.max_tokens,
+            ):
+                if self._cancelled:
+                    return
+                collected.append(token)
+                self.token_received.emit(token, self.target_tab)
         except Exception as e:
-            reply = f"[AI ERROR]: {str(e)}"
+            err = f"[AI ERROR]: {str(e)}"
+            collected.append(err)
+            if not self._cancelled:
+                self.token_received.emit(err, self.target_tab)
+
         if not self._cancelled:
-            self.finished.emit(reply, self.target_tab)
+            self.finished.emit("".join(collected), self.target_tab, self.is_plan)
 
 
 class APIWorker(QThread):
@@ -77,12 +103,16 @@ class ArcReactorRing(QWidget):
         self.setMinimumSize(180, 180)
         self.angle = 0
         self.active = False
+        self.voice_energy = 0
         self._hud_font = QFont("Consolas", 13)
         self._hud_font.setBold(True)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(35)
+
+    def set_voice_energy(self, level: int):
+        self.voice_energy = max(0, min(100, level))
 
     def _tick(self):
         speed = 7 if self.active else 2
@@ -95,7 +125,8 @@ class ArcReactorRing(QWidget):
 
         w, h = self.width(), self.height()
         cx, cy = w // 2, h // 2
-        radius = min(w, h) // 2 - 14
+        pulse = int((self.voice_energy / 100.0) * 6)
+        radius = min(w, h) // 2 - 16 + pulse
 
         pen_outer = QPen(QColor("#00E5FF"), 3)
         painter.setPen(pen_outer)
@@ -116,23 +147,37 @@ class TraccyDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TRACCY — Personal AI Operating System")
-        self.resize(1280, 780)
+        self.resize(1280, 800)
 
-        self.brain = TraccyBrain()
+        # Core Engines: Memory, Brain, Planner, Permissions, Voice
+        self.memory = TraccyMemory()
+        self.brain = TraccyBrain(memory=self.memory)
+        self.planner = CollaborativePlanner()
+
+        saved_dir = self.memory.get_setting("project_dir", os.getcwd())
+        self.project_dir = saved_dir if os.path.isdir(saved_dir) else os.getcwd()
+        self.permissions = PermissionManager(approved_project_dir=self.project_dir)
+
         self.voice = VoiceEngine(self)
         self._active_workers = []
         self.ai_worker = None
         self.api_worker = None
-        self.project_dir = os.getcwd()
+        self._last_user_goal = ""
+        self._stream_started = False
 
         self._apply_theme()
         self._build_ui()
+        self._restore_chat_history()
 
-        # Connect Voice Signals safely after UI creation
+        # Connect Voice Signals
         self.voice.heard_text.connect(self._on_voice_heard)
         self.voice.status_changed.connect(self._on_voice_status)
         self.voice.stop_triggered.connect(self._handle_stop)
-        self.voice.mic_level.connect(self.mic_bar.setValue)
+        self.voice.mic_level.connect(self._on_mic_level)
+
+    def _on_mic_level(self, level: int):
+        self.mic_bar.setValue(level)
+        self.ring.set_voice_energy(level)
 
     def _register_worker(self, worker: QThread):
         self._active_workers.append(worker)
@@ -141,17 +186,33 @@ class TraccyDashboard(QMainWindow):
     def _cleanup_worker(self, worker: QThread):
         if worker in self._active_workers:
             self._active_workers.remove(worker)
+        if self.ai_worker is worker:
+            self.ai_worker = None
+        if self.api_worker is worker:
+            self.api_worker = None
         worker.deleteLater()
 
+    def _cancel_current_ai_worker(self):
+        if self.ai_worker is not None:
+            try:
+                if self.ai_worker.isRunning():
+                    self.ai_worker.cancel()
+            except RuntimeError:
+                pass
+            self.ai_worker = None
+
     def closeEvent(self, event):
-        """Cleanly halts voice streams and background QThreads when closing the window."""
         self.voice.stop_all()
+        self._cancel_current_ai_worker()
         for worker in list(self._active_workers):
-            if hasattr(worker, "cancel"):
-                worker.cancel()
-            if worker.isRunning():
-                worker.quit()
-                worker.wait(1500)
+            try:
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(1500)
+            except RuntimeError:
+                pass
         event.accept()
 
     def _apply_theme(self):
@@ -168,6 +229,11 @@ class TraccyDashboard(QMainWindow):
                 border: 1px solid #1E293B;
                 border-radius: 10px;
             }
+            QFrame#ApprovalBar {
+                background-color: #0F172A;
+                border: 1px solid #00E5FF;
+                border-radius: 8px;
+            }
             QPushButton {
                 background-color: #1E293B;
                 color: #38BDF8;
@@ -179,6 +245,14 @@ class TraccyDashboard(QMainWindow):
             QPushButton:hover {
                 background-color: #0F172A;
                 border-color: #00E5FF;
+            }
+            QPushButton#ApproveBtn {
+                background-color: #14532D;
+                color: #BBF7D0;
+                border: 1px solid #22C55E;
+            }
+            QPushButton#ApproveBtn:hover {
+                background-color: #166534;
             }
             QPushButton#StopBtn {
                 background-color: #7F1D1D;
@@ -233,7 +307,7 @@ class TraccyDashboard(QMainWindow):
         title = QLabel("TRACCY // PERSONAL AI OPERATING SYSTEM")
         title.setStyleSheet("color: #00E5FF; font-family: 'Consolas'; font-size: 14px; font-weight: bold;")
 
-        self.status_badge = QLabel("● READY  |  VOICE + CODE SCANNER + API BENCHMARK")
+        self.status_badge = QLabel("● READY  |  STREAMING + MEMORY + VOICE")
         self.status_badge.setStyleSheet("color: #22C55E; font-family: 'Consolas'; font-size: 12px;")
 
         stop_btn = QPushButton("■ STOP")
@@ -283,10 +357,18 @@ class TraccyDashboard(QMainWindow):
         self.tts_checkbox.setChecked(True)
         self.tts_checkbox.setStyleSheet("color: #CBD5E1; font-size: 12px;")
 
+        self.wake_checkbox = QCheckBox("🎯 Require 'Hey TRACCY' Wake Word")
+        self.wake_checkbox.setChecked(False)
+        self.wake_checkbox.setStyleSheet("color: #CBD5E1; font-size: 12px;")
+        self.wake_checkbox.toggled.connect(self._toggle_wake_word)
+
+        btn_clear_chat = QPushButton("🧹 Clear Stale Context")
+        btn_clear_chat.clicked.connect(self._clear_context)
+
         quick_label = QLabel("QUICK ENGINEERING ACTIONS")
         quick_label.setStyleSheet("color: #64748B; font-size: 11px; font-weight: bold; margin-top: 10px;")
 
-        btn_select_proj = QPushButton("📂 Select Project Folder")
+        btn_select_proj = QPushButton("📂 Select Approved Project Folder")
         btn_select_proj.clicked.connect(self._choose_project_folder)
 
         btn_bug = QPushButton("🐞 Open Bug Scanner Tab")
@@ -301,6 +383,8 @@ class TraccyDashboard(QMainWindow):
         hud_layout.addWidget(self.mic_bar)
         hud_layout.addWidget(self.listen_btn)
         hud_layout.addWidget(self.tts_checkbox)
+        hud_layout.addWidget(self.wake_checkbox)
+        hud_layout.addWidget(btn_clear_chat)
         hud_layout.addWidget(quick_label)
         hud_layout.addWidget(btn_select_proj)
         hud_layout.addWidget(btn_bug)
@@ -314,17 +398,39 @@ class TraccyDashboard(QMainWindow):
 
         self.tabs = QTabWidget()
 
-        # TAB 1: Command Console
+        # TAB 1: Command Console + Plan Approval Gate
         console_tab = QWidget()
         console_layout = QVBoxLayout(console_tab)
 
         self.chat_log = QTextEdit()
         self.chat_log.setReadOnly(True)
-        self.chat_log.append("[TRACCY]: System online and stabilized. Speak or type a command below.\n")
+
+        # Plan Approval Bar (Visible when a plan awaits your approval)
+        self.approval_bar = QFrame()
+        self.approval_bar.setObjectName("ApprovalBar")
+        self.approval_bar.setVisible(False)
+        approval_layout = QHBoxLayout(self.approval_bar)
+        approval_layout.setContentsMargins(12, 8, 12, 8)
+
+        self.approval_label = QLabel("📋 PLAN AWAITING YOUR APPROVAL")
+        self.approval_label.setStyleSheet("color: #00E5FF; font-family: 'Consolas'; font-weight: bold;")
+
+        btn_approve = QPushButton("✅ Approve & Execute Plan")
+        btn_approve.setObjectName("ApproveBtn")
+        btn_approve.clicked.connect(self._approve_active_plan)
+
+        btn_reject = QPushButton("✖ Reject / Modify")
+        btn_reject.setObjectName("StopBtn")
+        btn_reject.clicked.connect(self._reject_active_plan)
+
+        approval_layout.addWidget(self.approval_label)
+        approval_layout.addStretch()
+        approval_layout.addWidget(btn_approve)
+        approval_layout.addWidget(btn_reject)
 
         input_row = QHBoxLayout()
         self.prompt_input = QLineEdit()
-        self.prompt_input.setPlaceholderText("Ask TRACCY anything or click 'Start Voice Listening'...")
+        self.prompt_input.setPlaceholderText("Discuss a project, ask TRACCY to build/check code, or speak...")
         self.prompt_input.returnPressed.connect(self._send_command)
 
         send_btn = QPushButton("Execute")
@@ -334,6 +440,7 @@ class TraccyDashboard(QMainWindow):
         input_row.addWidget(send_btn)
 
         console_layout.addWidget(self.chat_log)
+        console_layout.addWidget(self.approval_bar)
         console_layout.addLayout(input_row)
 
         # TAB 2: Real Code & Bug Scanner
@@ -341,7 +448,7 @@ class TraccyDashboard(QMainWindow):
         scanner_layout = QVBoxLayout(scanner_tab)
 
         proj_row = QHBoxLayout()
-        self.proj_label = QLabel(f"Project: {self.project_dir}")
+        self.proj_label = QLabel(f"Approved Folder: {self.project_dir}")
         self.proj_label.setStyleSheet("color: #38BDF8; font-family: 'Consolas'; font-size: 12px;")
         browse_btn = QPushButton("Browse Folder")
         browse_btn.clicked.connect(self._choose_project_folder)
@@ -420,13 +527,39 @@ class TraccyDashboard(QMainWindow):
 
         main_layout.addWidget(splitter)
 
+    def _toggle_wake_word(self, checked: bool):
+        self.voice.wake_word_required = checked
+        if self.voice.listening:
+            self.voice._emit_ready_status()
+
+    def _clear_context(self):
+        self.brain.clear_memory()
+        self.planner.reject_plan()
+        self.approval_bar.setVisible(False)
+        self.chat_log.clear()
+        self.chat_log.append("[TRACCY]: Conversation context cleared. Ready for your next topic!\n")
+
+    def _restore_chat_history(self):
+        past = self.memory.get_recent_messages(limit=6)
+        if past:
+            self.chat_log.append("[MEMORY]: Restored previous session context from SQLite.\n")
+            for msg in past:
+                prefix = "[YOU]" if msg["role"] == "user" else "[TRACCY]"
+                self.chat_log.append(f"{prefix}: {msg['content']}\n")
+        else:
+            self.chat_log.append(
+                "[TRACCY]: Core online. Word-by-word streaming, memory, planner, and voice are active.\n"
+            )
+
     def _choose_project_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Target Project Folder", self.project_dir)
+        folder = QFileDialog.getExistingDirectory(self, "Select Approved Project Folder", self.project_dir)
         if folder:
             self.project_dir = folder
-            self.proj_label.setText(f"Project: {self.project_dir}")
+            self.permissions.set_approved_project(folder)
+            self.memory.set_setting("project_dir", folder)
+            self.proj_label.setText(f"Approved Folder: {self.project_dir}")
             self._refresh_file_list()
-            self.tabs.setCurrentIndex(1)
+            self.chat_log.append(f"[PERMISSIONS]: Approved workspace set to '{self.project_dir}'.\n")
 
     def _refresh_file_list(self):
         self.file_combo.clear()
@@ -444,6 +577,14 @@ class TraccyDashboard(QMainWindow):
             self.diag_log.setText("[ERROR]: Select a valid project folder with source files first.")
             return
 
+        allowed, reason = self.permissions.check_action("ANALYZE", full_path)
+        if not allowed:
+            self.diag_log.setText(f"[PERMISSION BLOCKED]: {reason}")
+            return
+
+        self._cancel_current_ai_worker()
+        self._stream_started = False
+
         code = read_code_file(full_path)
         filename = os.path.basename(full_path)
         self.diag_log.setText(f"Scanning {filename} with TRACCY AI Core...\nPlease wait...")
@@ -456,8 +597,11 @@ class TraccyDashboard(QMainWindow):
             "3. Concrete code improvements with fixed snippets\n\n"
             f"CODE:\n```\n{code}\n```"
         )
-        self.ai_worker = AIWorker(self.brain, prompt, target_tab="diag", stateless=True)
+        self.ai_worker = AIWorker(
+            self.brain, prompt, target_tab="diag", stateless=True, is_plan=False, max_tokens=900
+        )
         self._register_worker(self.ai_worker)
+        self.ai_worker.token_received.connect(self._on_ai_token)
         self.ai_worker.finished.connect(self._on_ai_reply)
         self.ai_worker.start()
 
@@ -504,7 +648,7 @@ class TraccyDashboard(QMainWindow):
             self.status_badge.setText(f"● {label}...")
             self.status_badge.setStyleSheet("color: #F59E0B; font-family: 'Consolas'; font-size: 12px;")
         else:
-            self.status_badge.setText("● READY  |  VOICE + CODE SCANNER + API BENCHMARK")
+            self.status_badge.setText("● READY  |  STREAMING + MEMORY + VOICE")
             self.status_badge.setStyleSheet("color: #22C55E; font-family: 'Consolas'; font-size: 12px;")
 
     def _toggle_voice(self):
@@ -528,14 +672,51 @@ class TraccyDashboard(QMainWindow):
         self._send_command()
 
     def _handle_stop(self):
-        if self.ai_worker and self.ai_worker.isRunning():
-            self.ai_worker.cancel()
+        self._cancel_current_ai_worker()
         self.voice.stop_all()
         self.listen_btn.setText("🎙 Start Voice Listening")
         self._set_busy(False)
         self.status_badge.setText("● STOPPED  |  EXECUTION & VOICE HALTED")
         self.status_badge.setStyleSheet("color: #EF4444; font-family: 'Consolas'; font-size: 12px;")
-        self.chat_log.append("[SYSTEM]: Voice and execution halted immediately.\n")
+        self.chat_log.append("\n[SYSTEM]: Voice and execution halted immediately.\n")
+
+    def _approve_active_plan(self):
+        if self.planner.current_plan_id is not None:
+            self.memory.update_plan_status(self.planner.current_plan_id, "APPROVED")
+        self.planner.approve_plan()
+        self.permissions.active_plan_approved = True
+        self.approval_bar.setVisible(False)
+
+        self._cancel_current_ai_worker()
+        self._stream_started = False
+
+        self.chat_log.append(
+            f"[PERMISSIONS]: Plan #{self.planner.current_plan_id} APPROVED for '{self.project_dir}'. Executing now..."
+        )
+        exec_prompt = (
+            f"The user has APPROVED your plan for: \"{self.planner.current_goal}\".\n"
+            f"Approved workspace: {self.project_dir}\n"
+            "Now provide the complete implementation code, directory structure, and verification steps clearly."
+        )
+        self._set_busy(True, "EXECUTING APPROVED PLAN")
+        self.ai_worker = AIWorker(
+            self.brain, exec_prompt, target_tab="console", stateless=False, is_plan=False, max_tokens=1200
+        )
+        self._register_worker(self.ai_worker)
+        self.ai_worker.token_received.connect(self._on_ai_token)
+        self.ai_worker.finished.connect(self._on_ai_reply)
+        self.ai_worker.start()
+
+    def _reject_active_plan(self):
+        if self.planner.current_plan_id is not None:
+            self.memory.update_plan_status(self.planner.current_plan_id, "REJECTED")
+        self.planner.reject_plan()
+        self.permissions.active_plan_approved = False
+        self.approval_bar.setVisible(False)
+        msg = "Plan cancelled. Tell me what you would like to change in our approach."
+        self.chat_log.append(f"[TRACCY]: {msg}\n")
+        if self.tts_checkbox.isChecked():
+            self.voice.speak(msg)
 
     def _send_command(self):
         text = self.prompt_input.text().strip()
@@ -544,26 +725,77 @@ class TraccyDashboard(QMainWindow):
         self.prompt_input.clear()
         self.chat_log.append(f"[YOU]: {text}")
 
-        if text.lower() in {"stop", "traccy stop"}:
+        lower = text.lower()
+        if lower in {"stop", "traccy stop"}:
             self._handle_stop()
             return
 
-        self._set_busy(True, "ANALYZING")
-        self.ai_worker = AIWorker(self.brain, text, target_tab="console", stateless=False)
+        if self.planner.status == "AWAITING_APPROVAL":
+            if lower in {"approve", "approve plan", "yes approve", "execute", "go ahead", "start"}:
+                self._approve_active_plan()
+                return
+            if lower in {"reject", "cancel plan", "no"}:
+                self._reject_active_plan()
+                return
+
+        self._cancel_current_ai_worker()
+        self._stream_started = False
+
+        self._last_user_goal = text
+        is_plan_req = self.planner.is_build_or_audit_request(text)
+        prompt_to_send = (
+            self.planner.build_planning_prompt(text, self.project_dir) if is_plan_req else text
+        )
+
+        self._set_busy(True, "PLANNING" if is_plan_req else "STREAMING")
+        self.ai_worker = AIWorker(
+            self.brain,
+            prompt_to_send,
+            target_tab="console",
+            stateless=False,
+            is_plan=is_plan_req,
+            max_tokens=110,
+        )
         self._register_worker(self.ai_worker)
+        self.ai_worker.token_received.connect(self._on_ai_token)
         self.ai_worker.finished.connect(self._on_ai_reply)
         self.ai_worker.start()
 
-    def _on_ai_reply(self, reply: str, target_tab: str):
+    def _on_ai_token(self, token: str, target_tab: str):
+        box = self.diag_log if target_tab == "diag" else self.chat_log
+        if not self._stream_started:
+            self._stream_started = True
+            if target_tab == "diag":
+                box.clear()
+            else:
+                box.append("[TRACCY]: ")
+        cursor = box.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(token)
+        box.setTextCursor(cursor)
+        box.ensureCursorVisible()
+
+    def _on_ai_reply(self, reply: str, target_tab: str, is_plan: bool):
         self._set_busy(False)
         if target_tab == "diag":
-            self.diag_log.setText(reply)
+            if not self._stream_started:
+                self.diag_log.setText(reply)
             if self.tts_checkbox.isChecked():
                 self.voice.speak("Code scan complete. Summary is ready on screen.")
-        else:
-            self.chat_log.append(f"[TRACCY]:\n{reply}\n")
-            if self.tts_checkbox.isChecked():
-                self.voice.speak(reply)
+            return
+
+        if not self._stream_started:
+            self.chat_log.append(f"[TRACCY]: {reply}")
+        self.chat_log.append("")  # Blank line after streamed reply finishes
+
+        if is_plan:
+            plan_id = self.memory.save_plan(self._last_user_goal, reply, self.project_dir)
+            self.planner.set_pending_plan(plan_id, self._last_user_goal, reply)
+            self.approval_label.setText(f"📋 PLAN #{plan_id} READY — AWAITING YOUR APPROVAL")
+            self.approval_bar.setVisible(True)
+
+        if self.tts_checkbox.isChecked():
+            self.voice.speak(reply)
 
 
 def main():
