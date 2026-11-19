@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import traceback
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -33,6 +34,7 @@ from voice.voice_engine import VoiceEngine
 
 class AIWorker(QThread):
     token_received = Signal(str, str)       # (token_chunk, target_tab)
+    sentence_ready = Signal(str, str)       # (complete_sentence, detected_lang)
     finished = Signal(str, str, bool)       # (full_reply, target_tab, is_plan)
 
     def __init__(
@@ -42,7 +44,8 @@ class AIWorker(QThread):
         target_tab: str = "console",
         stateless: bool = False,
         is_plan: bool = False,
-        max_tokens: int = 110,
+        max_tokens: int = 160,
+        detected_lang: str = "en",
     ):
         super().__init__()
         self.brain = brain
@@ -51,6 +54,7 @@ class AIWorker(QThread):
         self.stateless = stateless
         self.is_plan = is_plan
         self.max_tokens = max_tokens
+        self.detected_lang = detected_lang
         self._cancelled = False
 
     def cancel(self):
@@ -58,16 +62,28 @@ class AIWorker(QThread):
 
     def run(self):
         collected = []
+        sentence_buf = ""
         try:
             for token in self.brain.ask_stream(
                 self.prompt,
                 stateless=self.stateless,
                 max_tokens=self.max_tokens,
+                detected_lang=self.detected_lang,
             ):
                 if self._cancelled:
                     return
                 collected.append(token)
                 self.token_received.emit(token, self.target_tab)
+
+                # Stream sentences directly to TTS as soon as punctuation arrives
+                if self.target_tab == "console":
+                    sentence_buf += token
+                    parts = re.split(r"(?<=[.!?।])\s+", sentence_buf)
+                    if len(parts) > 1:
+                        for complete in parts[:-1]:
+                            if complete.strip():
+                                self.sentence_ready.emit(complete.strip(), self.detected_lang)
+                        sentence_buf = parts[-1]
         except Exception as e:
             err = f"[AI ERROR]: {str(e)}"
             collected.append(err)
@@ -75,6 +91,8 @@ class AIWorker(QThread):
                 self.token_received.emit(err, self.target_tab)
 
         if not self._cancelled:
+            if self.target_tab == "console" and sentence_buf.strip():
+                self.sentence_ready.emit(sentence_buf.strip(), self.detected_lang)
             self.finished.emit("".join(collected), self.target_tab, self.is_plan)
 
 
@@ -100,7 +118,7 @@ class APIWorker(QThread):
 class ArcReactorRing(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(180, 180)
+        self.setMinimumSize(170, 170)
         self.angle = 0
         self.active = False
         self.voice_energy = 0
@@ -146,10 +164,9 @@ class ArcReactorRing(QWidget):
 class TraccyDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TRACCY — Personal AI Operating System")
-        self.resize(1280, 800)
+        self.setWindowTitle("TRACCY — Conversational AI Voice Companion")
+        self.resize(1280, 820)
 
-        # Core Engines: Memory, Brain, Planner, Permissions, Voice
         self.memory = TraccyMemory()
         self.brain = TraccyBrain(memory=self.memory)
         self.planner = CollaborativePlanner()
@@ -163,6 +180,7 @@ class TraccyDashboard(QMainWindow):
         self.ai_worker = None
         self.api_worker = None
         self._last_user_goal = ""
+        self._last_lang = "en"
         self._stream_started = False
 
         self._apply_theme()
@@ -171,6 +189,7 @@ class TraccyDashboard(QMainWindow):
 
         # Connect Voice Signals
         self.voice.heard_text.connect(self._on_voice_heard)
+        self.voice.interim_text.connect(self._on_interim_speech)
         self.voice.status_changed.connect(self._on_voice_status)
         self.voice.stop_triggered.connect(self._handle_stop)
         self.voice.mic_level.connect(self._on_mic_level)
@@ -178,6 +197,9 @@ class TraccyDashboard(QMainWindow):
     def _on_mic_level(self, level: int):
         self.mic_bar.setValue(level)
         self.ring.set_voice_energy(level)
+
+    def _on_interim_speech(self, text: str):
+        self.live_transcript_label.setText(f"💬 Heard: \"{text}\"")
 
     def _register_worker(self, worker: QThread):
         self._active_workers.append(worker)
@@ -246,21 +268,25 @@ class TraccyDashboard(QMainWindow):
                 background-color: #0F172A;
                 border-color: #00E5FF;
             }
+            QPushButton#PTTBtn {
+                background-color: #0C4A6E;
+                color: #E0F2FE;
+                border: 1px solid #00E5FF;
+                padding: 10px;
+                font-size: 13px;
+            }
+            QPushButton#PTTBtn:pressed {
+                background-color: #0369A1;
+            }
             QPushButton#ApproveBtn {
                 background-color: #14532D;
                 color: #BBF7D0;
                 border: 1px solid #22C55E;
             }
-            QPushButton#ApproveBtn:hover {
-                background-color: #166534;
-            }
             QPushButton#StopBtn {
                 background-color: #7F1D1D;
                 color: #FECACA;
                 border: 1px solid #EF4444;
-            }
-            QPushButton#StopBtn:hover {
-                background-color: #991B1B;
             }
             QLineEdit, QTextEdit, QComboBox, QSpinBox {
                 background-color: #0F172A;
@@ -297,20 +323,20 @@ class TraccyDashboard(QMainWindow):
         main_layout.setContentsMargins(14, 14, 14, 14)
         main_layout.setSpacing(10)
 
-        # --- COMPACT TOP BAR ---
+        # --- TOP STATUS BAR ---
         top_bar = QFrame()
         top_bar.setObjectName("Card")
         top_bar.setMaximumHeight(54)
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(14, 6, 14, 6)
 
-        title = QLabel("TRACCY // PERSONAL AI OPERATING SYSTEM")
+        title = QLabel("TRACCY // CONVERSATIONAL AI COMPANION")
         title.setStyleSheet("color: #00E5FF; font-family: 'Consolas'; font-size: 14px; font-weight: bold;")
 
-        self.status_badge = QLabel("● READY  |  STREAMING + MEMORY + VOICE")
+        self.status_badge = QLabel("● READY  |  QWEN2.5 + WHISPER + NEURAL VOICE")
         self.status_badge.setStyleSheet("color: #22C55E; font-family: 'Consolas'; font-size: 12px;")
 
-        stop_btn = QPushButton("■ STOP")
+        stop_btn = QPushButton("■ STOP SPEAKING")
         stop_btn.setObjectName("StopBtn")
         stop_btn.clicked.connect(self._handle_stop)
 
@@ -321,15 +347,15 @@ class TraccyDashboard(QMainWindow):
         top_layout.addWidget(stop_btn)
         main_layout.addWidget(top_bar)
 
-        # --- MAIN HYBRID SPLITTER ---
+        # --- MAIN SPLITTER ---
         splitter = QSplitter(Qt.Horizontal)
 
-        # LEFT: HUD
+        # LEFT: VOICE HUD
         hud_card = QFrame()
         hud_card.setObjectName("Card")
         hud_layout = QVBoxLayout(hud_card)
 
-        hud_header = QLabel("VOICE & DIAGNOSTIC HUD")
+        hud_header = QLabel("CONVERSATIONAL VOICE HUD")
         hud_header.setStyleSheet("color: #38BDF8; font-family: 'Consolas'; font-weight: bold;")
         hud_header.setAlignment(Qt.AlignCenter)
 
@@ -339,6 +365,11 @@ class TraccyDashboard(QMainWindow):
         self.voice_status.setAlignment(Qt.AlignCenter)
         self.voice_status.setWordWrap(True)
         self.voice_status.setStyleSheet("color: #94A3B8; font-size: 12px;")
+
+        self.live_transcript_label = QLabel("💬 Heard: —")
+        self.live_transcript_label.setAlignment(Qt.AlignCenter)
+        self.live_transcript_label.setWordWrap(True)
+        self.live_transcript_label.setStyleSheet("color: #38BDF8; font-size: 12px; font-style: italic;")
 
         self.mic_bar = QProgressBar()
         self.mic_bar.setRange(0, 100)
@@ -350,23 +381,30 @@ class TraccyDashboard(QMainWindow):
             "QProgressBar::chunk { background-color: #22C55E; border-radius: 4px; }"
         )
 
-        self.listen_btn = QPushButton("🎙 Start Voice Listening")
+        # Push-to-Talk Button (Hold to speak, release to send)
+        self.ptt_btn = QPushButton("🎤 Hold to Talk (Push-to-Talk)")
+        self.ptt_btn.setObjectName("PTTBtn")
+        self.ptt_btn.pressed.connect(self.voice.begin_push_to_talk)
+        self.ptt_btn.released.connect(self.voice.end_push_to_talk)
+
+        # Hands-Free Continuous Conversation Toggle
+        self.listen_btn = QPushButton("🎙 Start Hands-Free Conversation")
         self.listen_btn.clicked.connect(self._toggle_voice)
 
         self.tts_checkbox = QCheckBox("🔊 Speak Replies Aloud")
         self.tts_checkbox.setChecked(True)
         self.tts_checkbox.setStyleSheet("color: #CBD5E1; font-size: 12px;")
 
-        self.wake_checkbox = QCheckBox("🎯 Require 'Hey TRACCY' Wake Word")
-        self.wake_checkbox.setChecked(False)
-        self.wake_checkbox.setStyleSheet("color: #CBD5E1; font-size: 12px;")
-        self.wake_checkbox.toggled.connect(self._toggle_wake_word)
+        self.cloud_checkbox = QCheckBox("⚡ Hybrid Cloud Brain (If API Key Set)")
+        self.cloud_checkbox.setChecked(False)
+        self.cloud_checkbox.setStyleSheet("color: #CBD5E1; font-size: 12px;")
+        self.cloud_checkbox.toggled.connect(self._toggle_hybrid_cloud)
 
-        btn_clear_chat = QPushButton("🧹 Clear Stale Context")
+        btn_clear_chat = QPushButton("🧹 New Conversation Topic")
         btn_clear_chat.clicked.connect(self._clear_context)
 
-        quick_label = QLabel("QUICK ENGINEERING ACTIONS")
-        quick_label.setStyleSheet("color: #64748B; font-size: 11px; font-weight: bold; margin-top: 10px;")
+        quick_label = QLabel("ENGINEERING TOOLS")
+        quick_label.setStyleSheet("color: #64748B; font-size: 11px; font-weight: bold; margin-top: 8px;")
 
         btn_select_proj = QPushButton("📂 Select Approved Project Folder")
         btn_select_proj.clicked.connect(self._choose_project_folder)
@@ -380,10 +418,12 @@ class TraccyDashboard(QMainWindow):
         hud_layout.addWidget(hud_header)
         hud_layout.addWidget(self.ring)
         hud_layout.addWidget(self.voice_status)
+        hud_layout.addWidget(self.live_transcript_label)
         hud_layout.addWidget(self.mic_bar)
+        hud_layout.addWidget(self.ptt_btn)
         hud_layout.addWidget(self.listen_btn)
         hud_layout.addWidget(self.tts_checkbox)
-        hud_layout.addWidget(self.wake_checkbox)
+        hud_layout.addWidget(self.cloud_checkbox)
         hud_layout.addWidget(btn_clear_chat)
         hud_layout.addWidget(quick_label)
         hud_layout.addWidget(btn_select_proj)
@@ -391,21 +431,20 @@ class TraccyDashboard(QMainWindow):
         hud_layout.addWidget(btn_api)
         hud_layout.addStretch()
 
-        # RIGHT: Workspace
+        # RIGHT: WORKSPACE TABS
         dev_card = QFrame()
         dev_card.setObjectName("Card")
         dev_layout = QVBoxLayout(dev_card)
 
         self.tabs = QTabWidget()
 
-        # TAB 1: Command Console + Plan Approval Gate
+        # TAB 1: Conversational Console
         console_tab = QWidget()
         console_layout = QVBoxLayout(console_tab)
 
         self.chat_log = QTextEdit()
         self.chat_log.setReadOnly(True)
 
-        # Plan Approval Bar (Visible when a plan awaits your approval)
         self.approval_bar = QFrame()
         self.approval_bar.setObjectName("ApprovalBar")
         self.approval_bar.setVisible(False)
@@ -430,10 +469,10 @@ class TraccyDashboard(QMainWindow):
 
         input_row = QHBoxLayout()
         self.prompt_input = QLineEdit()
-        self.prompt_input.setPlaceholderText("Discuss a project, ask TRACCY to build/check code, or speak...")
+        self.prompt_input.setPlaceholderText("Talk naturally in English or Gujarati, or type your thought...")
         self.prompt_input.returnPressed.connect(self._send_command)
 
-        send_btn = QPushButton("Execute")
+        send_btn = QPushButton("Send")
         send_btn.clicked.connect(self._send_command)
 
         input_row.addWidget(self.prompt_input)
@@ -443,7 +482,7 @@ class TraccyDashboard(QMainWindow):
         console_layout.addWidget(self.approval_bar)
         console_layout.addLayout(input_row)
 
-        # TAB 2: Real Code & Bug Scanner
+        # TAB 2: Code & Bug Scanner
         scanner_tab = QWidget()
         scanner_layout = QVBoxLayout(scanner_tab)
 
@@ -477,7 +516,7 @@ class TraccyDashboard(QMainWindow):
         scanner_layout.addLayout(file_row)
         scanner_layout.addWidget(self.diag_log)
 
-        # TAB 3: Live API Tester & Latency Benchmarker
+        # TAB 3: API Tester & Latency Benchmarker
         api_tab = QWidget()
         api_layout = QVBoxLayout(api_tab)
 
@@ -498,16 +537,16 @@ class TraccyDashboard(QMainWindow):
         url_row.addWidget(run_api_btn)
 
         self.token_input = QLineEdit()
-        self.token_input.setPlaceholderText("Optional JWT Bearer Token (paste token without 'Bearer ')...")
+        self.token_input.setPlaceholderText("Optional JWT Bearer Token...")
 
         self.body_input = QLineEdit()
-        self.body_input.setPlaceholderText('Optional JSON Body (e.g., {"email": "test@example.com", "password": "123"})...')
+        self.body_input.setPlaceholderText('Optional JSON Body...')
 
         self.perf_log = QTextEdit()
         self.perf_log.setReadOnly(True)
         self.perf_log.setText(
             "=== LIVE API TESTER & LATENCY BENCHMARK ===\n"
-            "Enter an endpoint URL and click 'Run Test & Benchmark' to measure status codes and avg/min/max latency."
+            "Enter an endpoint URL and click 'Run Test & Benchmark'."
         )
 
         api_layout.addLayout(url_row)
@@ -515,7 +554,7 @@ class TraccyDashboard(QMainWindow):
         api_layout.addWidget(self.body_input)
         api_layout.addWidget(self.perf_log)
 
-        self.tabs.addTab(console_tab, "Command Console")
+        self.tabs.addTab(console_tab, "Conversational Console")
         self.tabs.addTab(scanner_tab, "Bug & Code Scanner")
         self.tabs.addTab(api_tab, "API & Performance Tester")
 
@@ -523,32 +562,37 @@ class TraccyDashboard(QMainWindow):
 
         splitter.addWidget(hud_card)
         splitter.addWidget(dev_card)
-        splitter.setSizes([310, 970])
+        splitter.setSizes([320, 960])
 
         main_layout.addWidget(splitter)
 
-    def _toggle_wake_word(self, checked: bool):
-        self.voice.wake_word_required = checked
-        if self.voice.listening:
-            self.voice._emit_ready_status()
+    def _toggle_hybrid_cloud(self, checked: bool):
+        if checked and not self.brain.groq_api_key:
+            self.cloud_checkbox.setChecked(False)
+            self.chat_log.append(
+                "[SYSTEM]: Set GROQ_API_KEY in Windows Environment Variables to enable Hybrid Cloud mode.\n"
+            )
+            return
+        self.brain.hybrid_cloud_enabled = checked
 
     def _clear_context(self):
         self.brain.clear_memory()
         self.planner.reject_plan()
         self.approval_bar.setVisible(False)
+        self.live_transcript_label.setText("💬 Heard: —")
         self.chat_log.clear()
-        self.chat_log.append("[TRACCY]: Conversation context cleared. Ready for your next topic!\n")
+        self.chat_log.append("[TRACCY]: Fresh topic started. What's on your mind?\n")
 
     def _restore_chat_history(self):
-        past = self.memory.get_recent_messages(limit=6)
+        past = self.memory.get_recent_messages(limit=4)
         if past:
-            self.chat_log.append("[MEMORY]: Restored previous session context from SQLite.\n")
+            self.chat_log.append("[MEMORY]: Previous session loaded.\n")
             for msg in past:
                 prefix = "[YOU]" if msg["role"] == "user" else "[TRACCY]"
                 self.chat_log.append(f"{prefix}: {msg['content']}\n")
         else:
             self.chat_log.append(
-                "[TRACCY]: Core online. Word-by-word streaming, memory, planner, and voice are active.\n"
+                "[TRACCY]: Conversational Voice Companion online. Hold Push-to-Talk or start Hands-Free conversation.\n"
             )
 
     def _choose_project_folder(self):
@@ -587,14 +631,14 @@ class TraccyDashboard(QMainWindow):
 
         code = read_code_file(full_path)
         filename = os.path.basename(full_path)
-        self.diag_log.setText(f"Scanning {filename} with TRACCY AI Core...\nPlease wait...")
+        self.diag_log.setText(f"Scanning {filename}...\nPlease wait...")
         self._set_busy(True, f"SCANNING {filename.upper()}")
 
         prompt = (
             f"Analyze this file ({filename}) for:\n"
             "1. Critical bugs, null/edge-case risks, or logic errors\n"
-            "2. Security vulnerabilities (SQL injection, auth flaws, exposed secrets)\n"
-            "3. Concrete code improvements with fixed snippets\n\n"
+            "2. Security vulnerabilities\n"
+            "3. Concrete code improvements\n\n"
             f"CODE:\n```\n{code}\n```"
         )
         self.ai_worker = AIWorker(
@@ -648,37 +692,36 @@ class TraccyDashboard(QMainWindow):
             self.status_badge.setText(f"● {label}...")
             self.status_badge.setStyleSheet("color: #F59E0B; font-family: 'Consolas'; font-size: 12px;")
         else:
-            self.status_badge.setText("● READY  |  STREAMING + MEMORY + VOICE")
+            self.status_badge.setText("● READY  |  QWEN2.5 + WHISPER + NEURAL VOICE")
             self.status_badge.setStyleSheet("color: #22C55E; font-family: 'Consolas'; font-size: 12px;")
 
     def _toggle_voice(self):
         if not self.voice.listening:
             self.voice.start_listening()
             self.ring.active = True
-            self.listen_btn.setText("⏹ Stop Voice Listening")
+            self.listen_btn.setText("⏹ Stop Hands-Free Conversation")
         else:
             self.voice.stop_all()
             self.ring.active = False
-            self.listen_btn.setText("🎙 Start Voice Listening")
+            self.listen_btn.setText("🎙 Start Hands-Free Conversation")
 
     def _on_voice_status(self, text: str, color: str):
         self.voice_status.setText(text)
         self.voice_status.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px;")
         self.ring.active = self.voice.listening or self.voice.speaking
 
-    def _on_voice_heard(self, spoken_text: str):
+    def _on_voice_heard(self, spoken_text: str, detected_lang: str):
         self.tabs.setCurrentIndex(0)
+        self._last_lang = detected_lang
         self.prompt_input.setText(spoken_text)
-        self._send_command()
+        self._send_command(detected_lang=detected_lang)
 
     def _handle_stop(self):
         self._cancel_current_ai_worker()
-        self.voice.stop_all()
-        self.listen_btn.setText("🎙 Start Voice Listening")
+        self.voice.interrupt_speech_only()
         self._set_busy(False)
-        self.status_badge.setText("● STOPPED  |  EXECUTION & VOICE HALTED")
-        self.status_badge.setStyleSheet("color: #EF4444; font-family: 'Consolas'; font-size: 12px;")
-        self.chat_log.append("\n[SYSTEM]: Voice and execution halted immediately.\n")
+        self.status_badge.setText("● INTERRUPTED  |  READY TO LISTEN")
+        self.status_badge.setStyleSheet("color: #38BDF8; font-family: 'Consolas'; font-size: 12px;")
 
     def _approve_active_plan(self):
         if self.planner.current_plan_id is not None:
@@ -691,16 +734,22 @@ class TraccyDashboard(QMainWindow):
         self._stream_started = False
 
         self.chat_log.append(
-            f"[PERMISSIONS]: Plan #{self.planner.current_plan_id} APPROVED for '{self.project_dir}'. Executing now..."
+            f"[PERMISSIONS]: Plan #{self.planner.current_plan_id} APPROVED for '{self.project_dir}'. Executing..."
         )
         exec_prompt = (
             f"The user has APPROVED your plan for: \"{self.planner.current_goal}\".\n"
             f"Approved workspace: {self.project_dir}\n"
-            "Now provide the complete implementation code, directory structure, and verification steps clearly."
+            "Now provide the complete implementation code and verification steps clearly."
         )
         self._set_busy(True, "EXECUTING APPROVED PLAN")
         self.ai_worker = AIWorker(
-            self.brain, exec_prompt, target_tab="console", stateless=False, is_plan=False, max_tokens=1200
+            self.brain,
+            exec_prompt,
+            target_tab="console",
+            stateless=False,
+            is_plan=False,
+            max_tokens=1200,
+            detected_lang=self._last_lang,
         )
         self._register_worker(self.ai_worker)
         self.ai_worker.token_received.connect(self._on_ai_token)
@@ -713,16 +762,17 @@ class TraccyDashboard(QMainWindow):
         self.planner.reject_plan()
         self.permissions.active_plan_approved = False
         self.approval_bar.setVisible(False)
-        msg = "Plan cancelled. Tell me what you would like to change in our approach."
+        msg = "Plan cancelled. Tell me what you would like to change."
         self.chat_log.append(f"[TRACCY]: {msg}\n")
         if self.tts_checkbox.isChecked():
-            self.voice.speak(msg)
+            self.voice.speak(msg, self._last_lang)
 
-    def _send_command(self):
+    def _send_command(self, detected_lang: str = "en"):
         text = self.prompt_input.text().strip()
         if not text:
             return
         self.prompt_input.clear()
+        self.voice.interrupt_speech_only()
         self.chat_log.append(f"[YOU]: {text}")
 
         lower = text.lower()
@@ -742,22 +792,24 @@ class TraccyDashboard(QMainWindow):
         self._stream_started = False
 
         self._last_user_goal = text
-        is_plan_req = self.planner.is_build_or_audit_request(text)
+        is_plan_req = self.brain.context.should_trigger_formal_plan(text)
         prompt_to_send = (
             self.planner.build_planning_prompt(text, self.project_dir) if is_plan_req else text
         )
 
-        self._set_busy(True, "PLANNING" if is_plan_req else "STREAMING")
+        self._set_busy(True, "PLANNING" if is_plan_req else "THINKING")
         self.ai_worker = AIWorker(
             self.brain,
             prompt_to_send,
             target_tab="console",
             stateless=False,
             is_plan=is_plan_req,
-            max_tokens=110,
+            max_tokens=160,
+            detected_lang=detected_lang,
         )
         self._register_worker(self.ai_worker)
         self.ai_worker.token_received.connect(self._on_ai_token)
+        self.ai_worker.sentence_ready.connect(self._on_ai_sentence)
         self.ai_worker.finished.connect(self._on_ai_reply)
         self.ai_worker.start()
 
@@ -775,6 +827,10 @@ class TraccyDashboard(QMainWindow):
         box.setTextCursor(cursor)
         box.ensureCursorVisible()
 
+    def _on_ai_sentence(self, sentence: str, lang: str):
+        if self.tts_checkbox.isChecked():
+            self.voice.speak_sentence(sentence, lang)
+
     def _on_ai_reply(self, reply: str, target_tab: str, is_plan: bool):
         self._set_busy(False)
         if target_tab == "diag":
@@ -786,16 +842,13 @@ class TraccyDashboard(QMainWindow):
 
         if not self._stream_started:
             self.chat_log.append(f"[TRACCY]: {reply}")
-        self.chat_log.append("")  # Blank line after streamed reply finishes
+        self.chat_log.append("")
 
         if is_plan:
             plan_id = self.memory.save_plan(self._last_user_goal, reply, self.project_dir)
             self.planner.set_pending_plan(plan_id, self._last_user_goal, reply)
             self.approval_label.setText(f"📋 PLAN #{plan_id} READY — AWAITING YOUR APPROVAL")
             self.approval_bar.setVisible(True)
-
-        if self.tts_checkbox.isChecked():
-            self.voice.speak(reply)
 
 
 def main():
