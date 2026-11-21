@@ -29,6 +29,7 @@ from core.planner import CollaborativePlanner
 from memory.db import TraccyMemory
 from tools.api_tester import test_api_endpoint
 from tools.code_scanner import list_project_files, read_code_file
+from tools.workspace_control import WorkspaceController
 from voice.voice_engine import VoiceEngine
 
 
@@ -75,7 +76,6 @@ class AIWorker(QThread):
                 collected.append(token)
                 self.token_received.emit(token, self.target_tab)
 
-                # Stream sentences directly to TTS as soon as punctuation arrives
                 if self.target_tab == "console":
                     sentence_buf += token
                     parts = re.split(r"(?<=[.!?।])\s+", sentence_buf)
@@ -164,7 +164,7 @@ class ArcReactorRing(QWidget):
 class TraccyDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TRACCY — Conversational AI Voice Companion")
+        self.setWindowTitle("TRACCY — Conversational AI & Workspace Companion")
         self.resize(1280, 820)
 
         self.memory = TraccyMemory()
@@ -174,6 +174,7 @@ class TraccyDashboard(QMainWindow):
         saved_dir = self.memory.get_setting("project_dir", os.getcwd())
         self.project_dir = saved_dir if os.path.isdir(saved_dir) else os.getcwd()
         self.permissions = PermissionManager(approved_project_dir=self.project_dir)
+        self.workspace = WorkspaceController(self.permissions)
 
         self.voice = VoiceEngine(self)
         self._active_workers = []
@@ -182,6 +183,7 @@ class TraccyDashboard(QMainWindow):
         self._last_user_goal = ""
         self._last_lang = "en"
         self._stream_started = False
+        self._executing_approved_plan = False
 
         self._apply_theme()
         self._build_ui()
@@ -330,10 +332,10 @@ class TraccyDashboard(QMainWindow):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(14, 6, 14, 6)
 
-        title = QLabel("TRACCY // CONVERSATIONAL AI COMPANION")
+        title = QLabel("TRACCY // CONVERSATIONAL AI & WORKSPACE OS")
         title.setStyleSheet("color: #00E5FF; font-family: 'Consolas'; font-size: 14px; font-weight: bold;")
 
-        self.status_badge = QLabel("● READY  |  QWEN2.5 + WHISPER + NEURAL VOICE")
+        self.status_badge = QLabel("● READY  |  VOICE + STREAMING + VS CODE")
         self.status_badge.setStyleSheet("color: #22C55E; font-family: 'Consolas'; font-size: 12px;")
 
         stop_btn = QPushButton("■ STOP SPEAKING")
@@ -403,11 +405,14 @@ class TraccyDashboard(QMainWindow):
         btn_clear_chat = QPushButton("🧹 New Conversation Topic")
         btn_clear_chat.clicked.connect(self._clear_context)
 
-        quick_label = QLabel("ENGINEERING TOOLS")
+        quick_label = QLabel("ENGINEERING & VS CODE TOOLS")
         quick_label.setStyleSheet("color: #64748B; font-size: 11px; font-weight: bold; margin-top: 8px;")
 
         btn_select_proj = QPushButton("📂 Select Approved Project Folder")
         btn_select_proj.clicked.connect(self._choose_project_folder)
+
+        btn_vscode = QPushButton("💻 Open Workspace in VS Code")
+        btn_vscode.clicked.connect(self._open_workspace_in_vscode)
 
         btn_bug = QPushButton("🐞 Open Bug Scanner Tab")
         btn_bug.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
@@ -427,6 +432,7 @@ class TraccyDashboard(QMainWindow):
         hud_layout.addWidget(btn_clear_chat)
         hud_layout.addWidget(quick_label)
         hud_layout.addWidget(btn_select_proj)
+        hud_layout.addWidget(btn_vscode)
         hud_layout.addWidget(btn_bug)
         hud_layout.addWidget(btn_api)
         hud_layout.addStretch()
@@ -454,7 +460,7 @@ class TraccyDashboard(QMainWindow):
         self.approval_label = QLabel("📋 PLAN AWAITING YOUR APPROVAL")
         self.approval_label.setStyleSheet("color: #00E5FF; font-family: 'Consolas'; font-weight: bold;")
 
-        btn_approve = QPushButton("✅ Approve & Execute Plan")
+        btn_approve = QPushButton("✅ Approve & Write Files")
         btn_approve.setObjectName("ApproveBtn")
         btn_approve.clicked.connect(self._approve_active_plan)
 
@@ -469,7 +475,7 @@ class TraccyDashboard(QMainWindow):
 
         input_row = QHBoxLayout()
         self.prompt_input = QLineEdit()
-        self.prompt_input.setPlaceholderText("Talk naturally in English or Gujarati, or type your thought...")
+        self.prompt_input.setPlaceholderText("Talk naturally in English or Gujarati, or say 'create a plan to build...'")
         self.prompt_input.returnPressed.connect(self._send_command)
 
         send_btn = QPushButton("Send")
@@ -540,7 +546,7 @@ class TraccyDashboard(QMainWindow):
         self.token_input.setPlaceholderText("Optional JWT Bearer Token...")
 
         self.body_input = QLineEdit()
-        self.body_input.setPlaceholderText('Optional JSON Body...')
+        self.body_input.setPlaceholderText("Optional JSON Body...")
 
         self.perf_log = QTextEdit()
         self.perf_log.setReadOnly(True)
@@ -566,6 +572,10 @@ class TraccyDashboard(QMainWindow):
 
         main_layout.addWidget(splitter)
 
+    def _open_workspace_in_vscode(self):
+        ok, msg = self.workspace.open_in_vscode()
+        self.chat_log.append(f"[VS CODE]: {msg}\n")
+
     def _toggle_hybrid_cloud(self, checked: bool):
         if checked and not self.brain.groq_api_key:
             self.cloud_checkbox.setChecked(False)
@@ -578,6 +588,8 @@ class TraccyDashboard(QMainWindow):
     def _clear_context(self):
         self.brain.clear_memory()
         self.planner.reject_plan()
+        self.permissions.active_plan_approved = False
+        self._executing_approved_plan = False
         self.approval_bar.setVisible(False)
         self.live_transcript_label.setText("💬 Heard: —")
         self.chat_log.clear()
@@ -592,7 +604,7 @@ class TraccyDashboard(QMainWindow):
                 self.chat_log.append(f"{prefix}: {msg['content']}\n")
         else:
             self.chat_log.append(
-                "[TRACCY]: Conversational Voice Companion online. Hold Push-to-Talk or start Hands-Free conversation.\n"
+                "[TRACCY]: Conversational Voice & Workspace OS online. Hold Push-to-Talk or start Hands-Free conversation.\n"
             )
 
     def _choose_project_folder(self):
@@ -692,7 +704,7 @@ class TraccyDashboard(QMainWindow):
             self.status_badge.setText(f"● {label}...")
             self.status_badge.setStyleSheet("color: #F59E0B; font-family: 'Consolas'; font-size: 12px;")
         else:
-            self.status_badge.setText("● READY  |  QWEN2.5 + WHISPER + NEURAL VOICE")
+            self.status_badge.setText("● READY  |  VOICE + STREAMING + VS CODE")
             self.status_badge.setStyleSheet("color: #22C55E; font-family: 'Consolas'; font-size: 12px;")
 
     def _toggle_voice(self):
@@ -718,6 +730,7 @@ class TraccyDashboard(QMainWindow):
 
     def _handle_stop(self):
         self._cancel_current_ai_worker()
+        self._executing_approved_plan = False
         self.voice.interrupt_speech_only()
         self._set_busy(False)
         self.status_badge.setText("● INTERRUPTED  |  READY TO LISTEN")
@@ -732,23 +745,26 @@ class TraccyDashboard(QMainWindow):
 
         self._cancel_current_ai_worker()
         self._stream_started = False
+        self._executing_approved_plan = True
 
         self.chat_log.append(
-            f"[PERMISSIONS]: Plan #{self.planner.current_plan_id} APPROVED for '{self.project_dir}'. Executing..."
+            f"[PERMISSIONS]: Plan #{self.planner.current_plan_id} APPROVED for '{self.project_dir}'. Writing files..."
         )
         exec_prompt = (
             f"The user has APPROVED your plan for: \"{self.planner.current_goal}\".\n"
             f"Approved workspace: {self.project_dir}\n"
-            "Now provide the complete implementation code and verification steps clearly."
+            "Output every file using a fenced code block with its exact relative file path on the opening line, "
+            "like:\n```python src/main.py\n# code here\n```\n"
+            "Provide complete, clean, working code for each file."
         )
-        self._set_busy(True, "EXECUTING APPROVED PLAN")
+        self._set_busy(True, "WRITING FILES TO WORKSPACE")
         self.ai_worker = AIWorker(
             self.brain,
             exec_prompt,
             target_tab="console",
             stateless=False,
             is_plan=False,
-            max_tokens=1200,
+            max_tokens=1400,
             detected_lang=self._last_lang,
         )
         self._register_worker(self.ai_worker)
@@ -761,6 +777,7 @@ class TraccyDashboard(QMainWindow):
             self.memory.update_plan_status(self.planner.current_plan_id, "REJECTED")
         self.planner.reject_plan()
         self.permissions.active_plan_approved = False
+        self._executing_approved_plan = False
         self.approval_bar.setVisible(False)
         msg = "Plan cancelled. Tell me what you would like to change."
         self.chat_log.append(f"[TRACCY]: {msg}\n")
@@ -780,6 +797,10 @@ class TraccyDashboard(QMainWindow):
             self._handle_stop()
             return
 
+        if lower in {"open vs code", "open vscode", "open workspace"}:
+            self._open_workspace_in_vscode()
+            return
+
         if self.planner.status == "AWAITING_APPROVAL":
             if lower in {"approve", "approve plan", "yes approve", "execute", "go ahead", "start"}:
                 self._approve_active_plan()
@@ -790,6 +811,7 @@ class TraccyDashboard(QMainWindow):
 
         self._cancel_current_ai_worker()
         self._stream_started = False
+        self._executing_approved_plan = False
 
         self._last_user_goal = text
         is_plan_req = self.brain.context.should_trigger_formal_plan(text)
@@ -843,6 +865,25 @@ class TraccyDashboard(QMainWindow):
         if not self._stream_started:
             self.chat_log.append(f"[TRACCY]: {reply}")
         self.chat_log.append("")
+
+        if self._executing_approved_plan:
+            self._executing_approved_plan = False
+            results = self.workspace.write_all_from_response(reply)
+            if results:
+                first_written = None
+                for ok, info in results:
+                    status = "✅ CREATED" if ok else "⚠️ SKIPPED"
+                    self.chat_log.append(f"[{status}]: {info}")
+                    if ok and first_written is None:
+                        first_written = info
+                self._refresh_file_list()
+                if first_written:
+                    _, vs_msg = self.workspace.open_in_vscode(first_written)
+                    self.chat_log.append(f"[VS CODE]: {vs_msg}\n")
+                    if self.tts_checkbox.isChecked():
+                        self.voice.speak("Files created and opened in VS Code.", self._last_lang)
+            else:
+                self.chat_log.append("[WORKSPACE]: No file blocks detected in response.\n")
 
         if is_plan:
             plan_id = self.memory.save_plan(self._last_user_goal, reply, self.project_dir)
